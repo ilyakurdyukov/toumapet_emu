@@ -17,6 +17,14 @@ You can also build it with SDL1.2 or SDL2: `$ make SDL=1` or `$ make SDL=2`
 $ ./toumapet --rom ok550.bin
 ```
 
+### Controls
+
+| Key(s)           | Action             |
+|------------------|--------------------|
+| A/Left           | left (select)      |
+| S/Down           | middle (enter)     |
+| D/Right          | right (back/menu)  |
+
 ### What is not working
 
 This is an early version of the emulator. There is no sound, the game is not saved upon exit, there may be various bugs.

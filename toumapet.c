@@ -20,6 +20,12 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifndef CPU_TRACE
+#define CPU_TRACE 0
+#endif
+
+//#define TICK_LIMIT 1000000
+
 #define ERR_EXIT(...) do { \
 	if (glob_sys) sys_close(glob_sys); \
 	fprintf(stderr, __VA_ARGS__); \
@@ -53,12 +59,6 @@ typedef struct {
 #else
 #define SCREEN_H 160 // OK-560
 #endif
-
-#ifndef CPU_TRACE
-#define CPU_TRACE 1
-#endif
-
-//#define TICK_LIMIT 1000000
 
 typedef struct {
 	uint8_t *rom;
@@ -430,7 +430,8 @@ static void draw_image(sysctx_t *sys, int x, int y, unsigned pos, int flip, int 
 	} while (--h);
 }
 
-static void draw_char(sysctx_t *sys, int x, int y, unsigned id, int color) {
+static void draw_char(sysctx_t *sys, int x, int y,
+		unsigned id, int color, int bg) {
 	int w = 8, h = 16; uint8_t *d, *s;
 	unsigned pos = READ16(sys->rom + 7);
 	if (id < 0x20) ERR_EXIT("unsupported char\n");
@@ -448,6 +449,7 @@ static void draw_char(sysctx_t *sys, int x, int y, unsigned id, int color) {
 		int a = *s++;
 		for (x = 0; x < w; x++, a <<= 1)
 			if (a & 0x80) d[x] = color;
+			else if (bg >= 0) d[x] = bg;
 	}
 }
 
@@ -613,16 +615,17 @@ static void bios_24(sysctx_t *sys, cpu_state_t *s) {
 	int x = s->mem[0x100];
 	int y = s->mem[0x101];
 	int id = s->mem[0x102];
-	TRACE("draw_char (x = %u, y = %u, id = %u, color = 0x%02x)", x, y, id, s->mem[0x103]);
-	draw_char(sys, x, y, id, s->mem[0x103]);
+	TRACE("draw_char_alpha (x = %u, y = %u, id = %u, color = 0x%02x)", x, y, id, s->mem[0x103]);
+	draw_char(sys, x, y, id, s->mem[0x103], -1);
 }
 
 static void bios_26(sysctx_t *sys, cpu_state_t *s) {
 	int x = s->mem[0x100];
 	int y = s->mem[0x101];
 	int id = s->mem[0x102];
-	TRACE("draw_char2 (x = %u, y = %u, id = %u, color = 0x%02x)", x, y, id, s->mem[0x103]);
-	draw_char(sys, x, y, id, s->mem[0x103]);
+	TRACE("draw_char (x = %u, y = %u, id = %u, color = 0x%02x, bg = 0x%02x)",
+			x, y, id, s->mem[0x103], s->mem[0x104]);
+	draw_char(sys, x, y, id, s->mem[0x103], s->mem[0x104]);
 }
 
 static void bios_2c(sysctx_t *sys, cpu_state_t *s) {
@@ -635,7 +638,6 @@ static void bios_2c(sysctx_t *sys, cpu_state_t *s) {
 }
 
 void run_emu(sysctx_t *sys, cpu_state_t *s) {
-	uint8_t *rom = sys->rom;
 	unsigned pc = s->pc, t = s->flags;
 	uint8_t zflag; int8_t nflag, vflag; uint16_t cflag;
 	UNPACK_FLAGS
@@ -655,7 +657,7 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 		int o = -1; uint8_t *p = NULL;
 
 #if TICK_LIMIT
-		if (++op_limit > TICK_LIMIT)
+		if (++tickcount > TICK_LIMIT)
 			ERR_EXIT("instruction limit reached\n");
 #endif
 
@@ -701,11 +703,14 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 					ERR_EXIT("unknown syscall\n"); goto end;
 				}
 			} else if (pc == 0x6003) {
-				unsigned addr = READ24(s->mem + 0x80);
+				unsigned addr = READ24(s->mem + 0x80), i, n;
 				TRACE("ROM read (0x%x)\n", addr);
-				if (sys->rom_size < addr + 6)
+				if (sys->rom_size <= addr)
 					ERR_EXIT("read outside the ROM (0x%x)\n", addr);
-				memcpy(s->mem + 0x8d, sys->rom + addr, 6);
+				n = sys->rom_size - addr;
+				for (i = 0; i < 6; i++)
+					s->mem[0x8d + i] = i < n ?
+							sys->rom[addr + i] : ~sys->rom_key;
 			} else if (pc == SYS_RET) {
 				unsigned addr;
 				if (!depth) ERR_EXIT("call stack underflow\n");
