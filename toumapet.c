@@ -61,15 +61,21 @@ typedef struct {
 #endif
 
 typedef struct {
+	uint8_t state, cmd, narg, flags;
+	uint8_t args[3];
+	uint32_t addr;
+} flash_t;
+
+typedef struct {
 	uint8_t *rom;
 	uint32_t rom_size;
 	uint32_t frame_depth;
 	frame_t frame_stack[FRAME_STACK_MAX];
 	uint8_t screen[SCREEN_W * SCREEN_H];
 	uint32_t pal[256];
-	uint8_t rom_key;
+	uint8_t rom_key, init_done;
+	flash_t flash;
 	int zoom, keys;
-	uint32_t last_time, timer_rem;
 	window_t window;
 #if !USE_SDL && defined(_WIN32)
 	double time_mul;
@@ -407,20 +413,20 @@ static void draw_image(sysctx_t *sys, int x, int y, unsigned pos, int flip, int 
 	if (w <= 0 || h <= 0) return;
 	do {
 		int len = READ16(src);
-		uint8_t *s = src - 2, *d2 = d;
-		int a = 0, i = 4, n = 1, skip = x_skip;
+		uint8_t *s = src + 2, *d2 = d;
+		int a = 0, n = 1, skip = x_skip;
 
-		if ((int)size < len + 4)
+		if ((int)size < len)
 			ERR_EXIT("read outside the ROM\n");
-		src += len; size -= len; d += y_add;
+		src += len; size -= len; d += y_add; len -= 4;
 		if (--y_skip >= 0) continue;
 		w2 = w; do {
 			if (!--n) {
 				if ((len -= 1) < 0) ERR_EXIT("RLE error\n");
-				a = s[i++]; n = 1;
+				a = *s++; n = 1;
 				if (!a) {
 					if ((len -= 2) < 0) ERR_EXIT("RLE error\n");
-					a = s[i++]; n = s[i++];
+					a = *s++; n = *s++;
 					if (!n) ERR_EXIT("zero RLE count\n");
 				}
 			}
@@ -637,6 +643,108 @@ static void bios_2c(sysctx_t *sys, cpu_state_t *s) {
 			READ16(&sys->rom[addr + 1]), sys->rom[addr + 3]);
 }
 
+enum {
+	FLASH_OFF = 0,
+	FLASH_READY,
+	FLASH_CMD,
+	FLASH_CMD2
+};
+
+#if FLASH_TRACE
+#undef FLASH_TRACE
+#define FLASH_TRACE(...) printf(__VA_ARGS__)
+#else
+#undef FLASH_TRACE
+#define FLASH_TRACE(...) (void)0
+#endif
+
+static void flash_emu(sysctx_t *sys, cpu_state_t *s) {
+	unsigned data = s->mem[0x02];
+	flash_t *f = &sys->flash;
+	unsigned i = f->narg;
+
+	if (f->state == FLASH_OFF) return;
+	if (data & 8) { f->state = FLASH_OFF; return; }
+	if (f->state == FLASH_READY) {
+		if (data == 0) f->state = FLASH_CMD, f->narg = 1 * 16;
+		return;
+	}
+
+	if (i) {
+		if (((data & ~4) ^ (i & 1)) != 2)
+			ERR_EXIT("unexpected flash data\n");
+		f->narg = --i;
+		if (i & 1)
+			f->args[i >> 4] = f->args[i >> 4] << 1 | data >> 2;
+		else if ((data >> 2 ^ f->args[i >> 4]) & 1)
+			ERR_EXIT("wrong bit repeated\n");
+		if (i) return;
+	}
+
+	if (f->state == FLASH_CMD) {
+		f->cmd = f->args[0];
+		FLASH_TRACE("flash_cmd 0x%02x\n", f->cmd);
+		switch (f->cmd) {
+		case 0x50: /* Volatile SR Write Enable */
+			f->state = FLASH_OFF;
+			break;
+		case 0x06: /* Write Enable */
+		case 0x04: /* Write Disable */
+			f->flags = (f->flags & ~2) | (f->cmd & 2);
+			f->state = FLASH_OFF;
+			break;
+
+		case 0x05: /* Read Status Register */
+		case 0x01: /* Write Status Register */
+			f->state = FLASH_CMD2; f->narg = 1 * 16;
+			break;
+		case 0x02: /* Page Program */
+		case 0x20: /* Sector Erase */
+			f->state = FLASH_CMD2; f->narg = 3 * 16;
+			f->addr = ~0;
+			break;
+		default:
+			ERR_EXIT("unknown flash cmd 0x%02x\n", f->cmd);
+		}
+	} else {
+		unsigned addr;
+		switch (f->cmd) {
+		case 0x20: /* Sector Erase */
+			addr = READ24(f->args);
+			FLASH_TRACE("Sector Erase 0x%06x\n", addr);
+			if (addr & 0xfff)
+				ERR_EXIT("unaligned sector address 0x%06x\n", addr);
+			if (addr < 0x3f0000 || addr >= sys->rom_size)
+				ERR_EXIT("unexpected erase address 0x%06x\n", addr);
+			if (!(f->flags & 2)) { f->state = FLASH_OFF; break; }
+			memset(sys->rom + addr, -1, 0x1000);
+			f->state = FLASH_OFF;
+			break;
+		case 0x02: /* Page Program */
+			addr = f->addr;
+			if (addr == ~0u) {
+				f->addr = addr = READ24(f->args);
+				FLASH_TRACE("Page Program 0x%06x\n", addr);
+				if (addr & 0xff)
+					ERR_EXIT("unaligned page address 0x%06x\n", addr);
+				if (addr < 0x3f0000 || addr >= sys->rom_size)
+					ERR_EXIT("unexpected program address 0x%06x\n", addr);
+				if (!(f->flags & 2)) { f->state = FLASH_OFF; break; }
+				f->narg = 1 * 16;
+			} else {
+				sys->rom[addr] = f->args[0];
+				f->addr = ++addr;
+				if (addr & 0xff) f->narg = 1 * 16;
+				else f->state = FLASH_OFF;
+			}
+			break;
+		default:
+			f->state = FLASH_OFF;
+			break;
+		}
+	}
+}
+
 void run_emu(sysctx_t *sys, cpu_state_t *s) {
 	unsigned pc = s->pc, t = s->flags;
 	uint8_t zflag; int8_t nflag, vflag; uint16_t cflag;
@@ -798,7 +906,7 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 			// reads memory
 			switch (o) {
 			case 0x00: *p = ~sys->keys; break;
-			case 0x02: *p = 0; break; // 0x13271
+			case 0x02: *p &= ~2; break; // 0x13271
 			//case 0x01: *p |= 1 << 1; break; // charging
 			case 0x14: *p |= 1 << 6; break; // 0x129ff
 			case 0x7b: *p |= 1 << 3; break; // 0x106e5
@@ -1112,6 +1220,10 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 		}
 		if (p) {
 			*p = t;
+			if (o == 0x02) flash_emu(sys, s);
+			else if (o == 0x12) {
+				sys->flash.state = t ? FLASH_OFF : FLASH_READY;
+			}
 #if CPU_TRACE
 			if (o >= 0) TRACE("[0x%02x] = 0x%02x", o, t & 0xff);
 			else if (p == &s->a) TRACE("A = 0x%02x", t & 0xff);
@@ -1163,18 +1275,31 @@ static void game_event(sysctx_t *sys) {
 				sys->keys |= 1 << 16; return;
 			}
 			key2 = -1;
+			/* arranged by bit number */
 			switch (key) {
-			case '1': key2 = 2; break;
-			case '2': key2 = 3; break;
+			/* right side button */
+			case SYSKEY_PAGEDOWN:
+			case SYSKEY_A + 'e':
+				key2 = 2; break;
+			/* left side button */
+			case SYSKEY_DELETE:
+			case SYSKEY_A + 'q':
+				key2 = 3; break;
+			/* left (select) */
 			case SYSKEY_LEFT:
 			case SYSKEY_A + 'a':
-			case '3': key2 = 4; break;
+				key2 = 4; break;
+			/* middle (enter) */
 			case SYSKEY_DOWN:
 			case SYSKEY_A + 's':
-			case '4': key2 = 5; break;
+				key2 = 5; break;
+			/* right (back/menu) */
 			case SYSKEY_RIGHT:
 			case SYSKEY_A + 'd':
-			case '5': key2 = 6; break;
+				key2 = 6; break;
+			/* reset */
+			case SYSKEY_A + 'r':
+				key2 = 17; break;
 			}
 			if (key2 >= 0) {
 				key2 = 1 << key2;
@@ -1192,24 +1317,27 @@ static void game_event(sysctx_t *sys) {
 }
 
 void run_game(sysctx_t *sys, cpu_state_t *s) {
-	unsigned disp_time, frames = 0, fps = 30;
-	// s->mem[0x93] |= 0x10; // to increment timers
-	s->mem[0xa3] |= 1; // to play start animation
-
+	unsigned disp_time, frames, fps = 30;
+	unsigned last_time, timer_rem;
+reset:
+	frames = 0;
+	if (!sys->init_done) {
+		sys->init_done = 1;
+		s->mem[0xa3] |= 1; // to play start animation
 #if 0 // Opens at boot when the left and right buttons are pressed.
-	s->mem[0x93] |= 1; // to open test menu
+		s->mem[0x93] |= 1; // to open test menu
 #endif
+		s->mem[0x99] = sys->rom_key;
 
-	s->sp = 0x7f; // guess
-	s->pc = 0x60de;
-	WRITE24(s->mem + 0x80, READ16(sys->rom + 3));
-	WRITE16(s->mem + 0x83, READ16(sys->rom + 3 + 2));
-	run_emu(sys, s);
+		s->sp = 0x7f; // guess
+		s->pc = 0x60de;
+		WRITE24(s->mem + 0x80, READ16(sys->rom + 3));
+		WRITE16(s->mem + 0x83, READ16(sys->rom + 3 + 2));
+		run_emu(sys, s);
+	}
 
-	sys->last_time = sys_time_ms(sys);
-	sys->timer_rem = 0;
-
-	s->mem[0x99] = sys->rom_key;
+	last_time = sys_time_ms(sys);
+	timer_rem = 0;
 
 #ifndef START_DELAY
 // to be able to open the test menu
@@ -1223,18 +1351,15 @@ void run_game(sysctx_t *sys, cpu_state_t *s) {
 #endif
 
 	disp_time = sys_time_ms(sys);
-	while (!(sys->keys & 1 << 16)) {
+	while (!(sys->keys & 3 << 16)) {
 		int ev;
-		uint32_t last_time, cur_time;
-		unsigned a;
+		unsigned a, cur_time;
 
-		cur_time = sys_time_ms(sys);
-		last_time = sys->last_time;
-		a = cur_time - last_time;
+		a = sys_time_ms(sys) - last_time;
 		a = a * 256 / 1000;
-		sys->last_time = last_time + (a >> 8) * 1000;
-		s->mem[0xaf] += a - sys->timer_rem;
-		sys->timer_rem = a;
+		last_time += (a >> 8) * 1000;
+		s->mem[0xaf] += a - timer_rem;
+		timer_rem = a;
 
 		s->sp = 0x7f; // guess
 		s->pc = 0x60de;
@@ -1255,6 +1380,12 @@ void run_game(sysctx_t *sys, cpu_state_t *s) {
 #endif
 
 		game_event(sys);
+	}
+	if (!(sys->keys & 1 << 16)) {
+		sys->keys = 0;
+		sys->init_done = 0;
+		memset(s, 0, sizeof(*s));
+		goto reset;
 	}
 }
 
@@ -1279,6 +1410,7 @@ static void check_rom(sysctx_t *sys) {
 
 int main(int argc, char **argv) {
 	const char *rom_fn = "toumapet.bin";
+	const char *save_fn = NULL;
 #if CPU_TRACE
 	const char *log_fn = NULL;
 	int log_size = 4 << 20;
@@ -1289,7 +1421,12 @@ int main(int argc, char **argv) {
 	int zoom = 3;
 
 	while (argc > 1) {
-		if (!strcmp(argv[1], "--rom")) {
+		if (!strcmp(argv[1], "--save")) {
+			if (argc <= 2) ERR_EXIT("bad option\n");
+			save_fn = argv[2];
+			if (!*save_fn) save_fn = NULL;
+			argc -= 2; argv += 2;
+		} else if (!strcmp(argv[1], "--rom")) {
 			if (argc <= 2) ERR_EXIT("bad option\n");
 			rom_fn = argv[2];
 			argc -= 2; argv += 2;
@@ -1321,6 +1458,8 @@ int main(int argc, char **argv) {
 	memset(&sys, 0, sizeof(sys));
 	sys.rom = rom;
 	sys.rom_size = rom_size;
+	sys.zoom = zoom;
+	check_rom(&sys);
 
 #if CPU_TRACE
 	if (log_fn) {
@@ -1336,8 +1475,21 @@ int main(int argc, char **argv) {
 	}
 #endif
 
-	check_rom(&sys);
-	sys.zoom = zoom;
+	if (save_fn) {
+		unsigned n1, n2, n3;
+		FILE *f = fopen(save_fn, "rb");
+		if (f) {
+			n1 = fread(cpu.mem, 1, sizeof(cpu.mem), f);
+			n2 = fread(sys.rom + 0x3f0000, 1, 0x10000, f);
+			n3 = fread(sys.screen, 1, sizeof(sys.screen), f);
+			(void)n3;
+			fclose(f);
+			if (n1 != sizeof(cpu.mem)) ERR_EXIT("unexpected save size\n");
+			if (n2 != 0x10000) ERR_EXIT("unexpected save size\n");
+			sys.init_done = 1;
+		}
+	}
+
 	sys_init(&sys);
 
 	if (0) { // test keys
@@ -1358,6 +1510,17 @@ int main(int argc, char **argv) {
 	}
 
 	run_game(&sys, &cpu);
+
+	if (save_fn) {
+		FILE *f = fopen(save_fn, "wb");
+		if (f) {
+			fwrite(cpu.mem, 1, sizeof(cpu.mem), f);
+			fwrite(sys.rom + 0x3f0000, 1, 0x10000, f);
+			fwrite(sys.screen, 1, sizeof(sys.screen), f);
+			fclose(f);
+		}
+	}
+
 	sys_close(&sys);
 }
 

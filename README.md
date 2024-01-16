@@ -17,6 +17,8 @@ You can also build it with SDL1.2 or SDL2: `$ make SDL=1` or `$ make SDL=2`
 $ ./toumapet --rom ok550.bin
 ```
 
+* Use `--save <filename>` option to save game state on exit.
+
 ### Controls
 
 | Key(s)           | Action             |
@@ -24,7 +26,10 @@ $ ./toumapet --rom ok550.bin
 | A/Left           | left (select)      |
 | S/Down           | middle (enter)     |
 | D/Right          | right (back/menu)  |
+| Q/Delete         | left side button   |
+| E/PageDown       | right side button  |
+| R                | reset the game     |
 
 ### What is not working
 
-This is an early version of the emulator. There is no sound, the game is not saved upon exit, there may be various bugs.
+This is an early version of the emulator. There is no sound, there may be various bugs.
