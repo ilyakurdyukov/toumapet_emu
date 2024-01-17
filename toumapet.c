@@ -26,6 +26,8 @@
 
 //#define TICK_LIMIT 1000000
 
+#define SAVE_OFFS 0x3f0000
+
 #define ERR_EXIT(...) do { \
 	if (glob_sys) sys_close(glob_sys); \
 	fprintf(stderr, __VA_ARGS__); \
@@ -714,10 +716,10 @@ static void flash_emu(sysctx_t *sys, cpu_state_t *s) {
 			FLASH_TRACE("Sector Erase 0x%06x\n", addr);
 			if (addr & 0xfff)
 				ERR_EXIT("unaligned sector address 0x%06x\n", addr);
-			if (addr < 0x3f0000 || addr >= sys->rom_size)
+			if (addr < SAVE_OFFS || addr >= sys->rom_size)
 				ERR_EXIT("unexpected erase address 0x%06x\n", addr);
 			if (!(f->flags & 2)) { f->state = FLASH_OFF; break; }
-			memset(sys->rom + addr, -1, 0x1000);
+			memset(sys->rom + addr, 0xff ^ sys->rom_key, 0x1000);
 			f->state = FLASH_OFF;
 			break;
 		case 0x02: /* Page Program */
@@ -727,12 +729,12 @@ static void flash_emu(sysctx_t *sys, cpu_state_t *s) {
 				FLASH_TRACE("Page Program 0x%06x\n", addr);
 				if (addr & 0xff)
 					ERR_EXIT("unaligned page address 0x%06x\n", addr);
-				if (addr < 0x3f0000 || addr >= sys->rom_size)
+				if (addr < SAVE_OFFS || addr >= sys->rom_size)
 					ERR_EXIT("unexpected program address 0x%06x\n", addr);
 				if (!(f->flags & 2)) { f->state = FLASH_OFF; break; }
 				f->narg = 1 * 16;
 			} else {
-				sys->rom[addr] = f->args[0];
+				sys->rom[addr] = f->args[0] ^ sys->rom_key;
 				f->addr = ++addr;
 				if (addr & 0xff) f->narg = 1 * 16;
 				else f->state = FLASH_OFF;
@@ -745,12 +747,15 @@ static void flash_emu(sysctx_t *sys, cpu_state_t *s) {
 	}
 }
 
+static void game_event(sysctx_t *sys);
+
 void run_emu(sysctx_t *sys, cpu_state_t *s) {
 	unsigned pc = s->pc, t = s->flags;
 	uint8_t zflag; int8_t nflag, vflag; uint16_t cflag;
 	UNPACK_FLAGS
 	unsigned depth = sys->frame_depth, frame_size = 0;
 	frame_t *frames = sys->frame_stack;
+	unsigned input_timer = 0;
 #if TICK_LIMIT
 	unsigned tickcount = 0;
 #endif
@@ -905,7 +910,13 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 			TRACE("R[0x%02x] ", o);
 			// reads memory
 			switch (o) {
-			case 0x00: *p = ~sys->keys; break;
+			case 0x00:
+				if (++input_timer >= 16) {
+					input_timer = 0;
+					game_event(sys);
+				}
+				*p = ~sys->keys;
+				break;
 			case 0x02: *p &= ~2; break; // 0x13271
 			//case 0x01: *p |= 1 << 1; break; // charging
 			case 0x14: *p |= 1 << 6; break; // 0x129ff
@@ -1189,8 +1200,8 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 			break;
 
 		case 0xcb: /* WAI */
-			sys_sleep(1);
-			break;
+			sys->keys |= 1 << 19;
+			goto end;
 
 		/* undefined */
 		case 0x02: case 0x03: case 0x0b:
@@ -1223,6 +1234,12 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 			if (o == 0x02) flash_emu(sys, s);
 			else if (o == 0x12) {
 				sys->flash.state = t ? FLASH_OFF : FLASH_READY;
+			} else if (o == 0x00) {
+				/* power off */
+				if (!t) { sys->keys |= 1 << 18 | 1 << 20; break; }
+			} else if (o == 0x8000) { /* lcd_cmd */
+				if (t == 0x28) /* Display OFF */
+					sys->keys |= 1 << 20;
 			}
 #if CPU_TRACE
 			if (o >= 0) TRACE("[0x%02x] = 0x%02x", o, t & 0xff);
@@ -1238,6 +1255,7 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 end:
 	PACK_FLAGS
 	s->flags = t;
+	s->pc = pc;
 	sys->frame_depth = depth;
 }
 
@@ -1329,6 +1347,7 @@ reset:
 #endif
 		s->mem[0x99] = sys->rom_key;
 
+		sys->frame_depth = 0;
 		s->sp = 0x7f; // guess
 		s->pc = 0x60de;
 		WRITE24(s->mem + 0x80, READ16(sys->rom + 3));
@@ -1355,17 +1374,30 @@ reset:
 		int ev;
 		unsigned a, cur_time;
 
+		// decrease idle timer
+		a = READ16(s->mem + 0x181);
+		if (a) WRITE16(s->mem + 0x181, a - 1);
+
 		a = sys_time_ms(sys) - last_time;
 		a = a * 256 / 1000;
 		last_time += (a >> 8) * 1000;
 		s->mem[0xaf] += a - timer_rem;
 		timer_rem = a;
 
-		s->sp = 0x7f; // guess
-		s->pc = 0x60de;
-		WRITE24(s->mem + 0x80, READ16(sys->rom + 0x1b));
-		WRITE16(s->mem + 0x83, READ16(sys->rom + 0x1b + 2));
+		if (sys->keys & 1 << 19) { /* WAI */
+			sys->keys &= ~(1 << 19);
+		} else {
+			sys->frame_depth = 0;
+			s->sp = 0x7f; // guess
+			s->pc = 0x60de;
+			WRITE24(s->mem + 0x80, READ16(sys->rom + 0x1b));
+			WRITE16(s->mem + 0x83, READ16(sys->rom + 0x1b + 2));
+		}
 		run_emu(sys, s);
+		if (sys->keys & 1 << 20) { // clean screen
+			sys->keys &= ~(1 << 20);
+			memset(sys->screen, 0, sizeof(sys->screen));
+		}
 
 		sys_update(sys);
 #if 0
@@ -1382,7 +1414,7 @@ reset:
 		game_event(sys);
 	}
 	if (!(sys->keys & 1 << 16)) {
-		sys->keys = 0;
+		sys->keys &= 0xff;
 		sys->init_done = 0;
 		memset(s, 0, sizeof(*s));
 		goto reset;
@@ -1406,6 +1438,13 @@ static void check_rom(sysctx_t *sys) {
 	res_offs = READ24(sys->rom);
 	if (rom_size < res_offs)
 		ERR_EXIT("bad resources offset\n");
+}
+
+static void xor_save(sysctx_t *sys) {
+	unsigned i, key = sys->rom_key;
+	if (key)
+	for (i = SAVE_OFFS; i < sys->rom_size; i++)
+		sys->rom[i] ^= key;
 }
 
 int main(int argc, char **argv) {
@@ -1480,13 +1519,14 @@ int main(int argc, char **argv) {
 		FILE *f = fopen(save_fn, "rb");
 		if (f) {
 			n1 = fread(cpu.mem, 1, sizeof(cpu.mem), f);
-			n2 = fread(sys.rom + 0x3f0000, 1, 0x10000, f);
+			n2 = fread(sys.rom + SAVE_OFFS, 1, sys.rom_size - SAVE_OFFS, f);
 			n3 = fread(sys.screen, 1, sizeof(sys.screen), f);
 			(void)n3;
 			fclose(f);
 			if (n1 != sizeof(cpu.mem)) ERR_EXIT("unexpected save size\n");
 			if (n2 != 0x10000) ERR_EXIT("unexpected save size\n");
 			sys.init_done = 1;
+			xor_save(&sys);
 		}
 	}
 
@@ -1514,8 +1554,9 @@ int main(int argc, char **argv) {
 	if (save_fn) {
 		FILE *f = fopen(save_fn, "wb");
 		if (f) {
+			xor_save(&sys);
 			fwrite(cpu.mem, 1, sizeof(cpu.mem), f);
-			fwrite(sys.rom + 0x3f0000, 1, 0x10000, f);
+			fwrite(sys.rom + SAVE_OFFS, 1, sys.rom_size - SAVE_OFFS, f);
 			fwrite(sys.screen, 1, sizeof(sys.screen), f);
 			fclose(f);
 		}

@@ -110,7 +110,7 @@ static void decode_sound(uint8_t *src, size_t size, const char *fn) {
 	int bytes_sample = ch * (bits >> 3);
 	int samples = (size - 1) * 2;
 	uint8_t *d, *data = malloc(samples);
-	if (!data) printf("malloc failed");
+	if (!data) { printf("malloc failed"); return; }
 
 	d = data;
 	for (i = 1; i < size; i++) {
