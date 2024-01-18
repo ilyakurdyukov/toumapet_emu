@@ -26,8 +26,6 @@
 
 //#define TICK_LIMIT 1000000
 
-#define SAVE_OFFS 0x3f0000
-
 #define ERR_EXIT(...) do { \
 	if (glob_sys) sys_close(glob_sys); \
 	fprintf(stderr, __VA_ARGS__); \
@@ -56,11 +54,8 @@ typedef struct {
 } frame_t;
 
 #define SCREEN_W 128
-#if 1
-#define SCREEN_H 128 // OK-550
-#else
-#define SCREEN_H 160 // OK-560
-#endif
+// OK-550: 128, OK-560: 160
+#define SCREEN_H_MAX 160
 
 typedef struct {
 	uint8_t state, cmd, narg, flags;
@@ -70,14 +65,11 @@ typedef struct {
 
 typedef struct {
 	uint8_t *rom;
-	uint32_t rom_size;
-	uint32_t frame_depth;
-	frame_t frame_stack[FRAME_STACK_MAX];
-	uint8_t screen[SCREEN_W * SCREEN_H];
-	uint32_t pal[256];
-	uint8_t rom_key, init_done;
+	uint32_t rom_size, save_offs;
+	uint8_t rom_key, init_done, frame_depth;
+	uint8_t keymap[5];
 	flash_t flash;
-	int zoom, keys;
+	unsigned zoom, keys, model, screen_h;
 	window_t window;
 #if !USE_SDL && defined(_WIN32)
 	double time_mul;
@@ -87,6 +79,9 @@ typedef struct {
 	unsigned log_pos, log_size, log_overflow;
 	const char *log_fn;
 #endif
+	frame_t frame_stack[FRAME_STACK_MAX];
+	uint32_t pal[256];
+	uint8_t screen[SCREEN_W * SCREEN_H_MAX];
 } sysctx_t;
 
 static sysctx_t *glob_sys = NULL;
@@ -134,7 +129,7 @@ static void sys_close(sysctx_t *sys) {
 
 static void sys_init(sysctx_t *sys) {
 	int w = SCREEN_W * sys->zoom;
-	int h = SCREEN_H * sys->zoom;
+	int h = sys->screen_h * sys->zoom;
 	int i, as, rs, gs, bs;
 	const char *err = window_init(&sys->window, "ToumaPet", w, h);
 	if (err) ERR_EXIT("%s\n", err);
@@ -175,7 +170,7 @@ static void sys_update(sysctx_t *sys) {
 	uint32_t c, *d = sys->window.imagedata;
 	unsigned st = sys->window.stride >> 2;
 	uint8_t *s = sys->screen;
-	int j, x, y, w = SCREEN_W, h = SCREEN_H;
+	int j, x, y, w = SCREEN_W, h = sys->screen_h;
 
 #define X d[j++] = c
 #define M(m, X) case m: \
@@ -381,11 +376,13 @@ static unsigned get_image(sysctx_t *sys, unsigned id) {
 	return res_offs;
 }
 
-static void draw_image(sysctx_t *sys, int x, int y, unsigned pos, int flip, int alpha) {
+static void draw_image(sysctx_t *sys, int x, int y,
+		unsigned pos, int flip, int mask, int alpha) {
 	int w, h, x_skip = 0, y_skip = 0;
 	uint8_t *d, *src = sys->rom + pos;
 	uint32_t size = sys->rom_size - pos - 4;
 	int x_add, y_add, w2, h2;
+	int screen_h = sys->screen_h;
 
 	if (src[1] != 0 || src[3] != 0x80)
 		ERR_EXIT("unsupported image\n");
@@ -394,11 +391,11 @@ static void draw_image(sysctx_t *sys, int x, int y, unsigned pos, int flip, int 
 	if (flip > 3) ERR_EXIT("unsupported flip\n");
 
 	if (x >= SCREEN_W) x = (int8_t)x, x_skip = -x;
-	if (y >= SCREEN_H) y = (int8_t)y, y_skip = -y;
+	if (y >= screen_h) y = (int8_t)y, y_skip = -y;
 
-	if (x > SCREEN_W || y > SCREEN_H) return;
+	if (x > SCREEN_W || y > screen_h) return;
 	if (x + w > SCREEN_W) w = SCREEN_W - x;
-	if (y + h > SCREEN_H) h = SCREEN_H - y;
+	if (y + h > screen_h) h = screen_h - y;
 	d = &sys->screen[y * SCREEN_W + x];
 
 	x_add = 1; y_add = SCREEN_W;
@@ -432,7 +429,8 @@ static void draw_image(sysctx_t *sys, int x, int y, unsigned pos, int flip, int 
 					if (!n) ERR_EXIT("zero RLE count\n");
 				}
 			}
-			if (--skip < 0 && a != alpha) *d2 = a;
+			// this is not a mask, but some kind of transparency
+			if (--skip < 0 && a != alpha) *d2 = a & mask;
 			d2 += x_add;
 		} while (--w2);
 	} while (--h);
@@ -441,16 +439,18 @@ static void draw_image(sysctx_t *sys, int x, int y, unsigned pos, int flip, int 
 static void draw_char(sysctx_t *sys, int x, int y,
 		unsigned id, int color, int bg) {
 	int w = 8, h = 16; uint8_t *d, *s;
+	int screen_h = sys->screen_h;
 	unsigned pos = READ16(sys->rom + 7);
+
 	if (id < 0x20) ERR_EXIT("unsupported char\n");
 	id -= 0x20;
 	pos += id << 4;
 	if (sys->rom_size < pos + 16)
 		ERR_EXIT("read outside the ROM\n");
 
-	if (x > SCREEN_W || y > SCREEN_H) return;
+	if (x > SCREEN_W || y > screen_h) return;
 	if (x + w > SCREEN_W) w = SCREEN_W - x;
-	if (y + h > SCREEN_H) h = SCREEN_H - y;
+	if (y + h > screen_h) h = screen_h - y;
 	d = &sys->screen[y * SCREEN_W + x];
 	s = sys->rom + pos;
 	for (y = 0; y < h; y++, d += SCREEN_W) {
@@ -476,9 +476,9 @@ static void bios_08(sysctx_t *sys, cpu_state_t *s) {
 	int x = s->mem[0x100];
 	int y = s->mem[0x101];
 	int id = READ16(s->mem + 0x102);
-	TRACE("image_draw_alpha (x = %u, y = %u, id = %u, flip = %u, color = 0x%02x)",
+	TRACE("image_draw_alpha (x = %u, y = %u, id = %u, flip = %u, mask = 0x%02x)",
 			x, y, id, s->mem[0x104], s->mem[0x105]);
-	draw_image(sys, x, y, get_image(sys, id), s->mem[0x104], s->mem[0x105]);
+	draw_image(sys, x, y, get_image(sys, id), s->mem[0x104], s->mem[0x105], 0xff);
 }
 
 static void bios_0a(sysctx_t *sys, cpu_state_t *s) {
@@ -486,19 +486,20 @@ static void bios_0a(sysctx_t *sys, cpu_state_t *s) {
 	int y = s->mem[0x101];
 	int id = READ16(s->mem + 0x102);
 	unsigned res_offs = get_image(sys, id);
-	TRACE("image_draw (x = %u, y = %u, id = %u, flip = %u, color = 0x%02x)",
+	TRACE("image_draw (x = %u, y = %u, id = %u, flip = %u, mask = 0x%02x)",
 			x, y, id, s->mem[0x104], s->mem[0x105]);
-	draw_image(sys, x, y, get_image(sys, id), s->mem[0x104], -1);
+	draw_image(sys, x, y, get_image(sys, id), s->mem[0x104], s->mem[0x105], -1);
 }
 
 static void bios_0c(sysctx_t *sys, cpu_state_t *s) {
 	int start = s->mem[0x100];
 	int end = s->mem[0x101];
 	int color = s->mem[0x102];
+	int screen_h = sys->screen_h;
 	TRACE("clear_screen (start = %u, end = %u, color = 0x%02x)",
 			start, end, color);
 	end++;
-	if (end > SCREEN_H) end = SCREEN_H;
+	if (end > screen_h) end = screen_h;
 	if (start >= end) return;
 	end -= start;
 	memset(sys->screen + start * SCREEN_W, color, SCREEN_W * end);
@@ -509,6 +510,7 @@ static void bios_0e(sysctx_t *sys, cpu_state_t *s) {
 	int end = s->mem[0x101];
 	int x, y, w, h;
 	int id = READ16(s->mem + 0x102);
+	int screen_h = sys->screen_h;
 	unsigned res_offs;
 	TRACE("repeat_line (start = %u, end = %u, id = %u)",
 			start, end, id);
@@ -518,9 +520,9 @@ static void bios_0e(sysctx_t *sys, cpu_state_t *s) {
 	end++;
 	if (w == 1) {
 		uint8_t *p;
-		draw_image(sys, start, 0, get_image(sys, id), 0, -1);
+		draw_image(sys, start, 0, get_image(sys, id), 0, 0xff, -1);
 		if (end > SCREEN_W) end = SCREEN_W;
-		if (h > SCREEN_H) h = SCREEN_H;
+		if (h > screen_h) h = screen_h;
 		if (start >= end) return;
 		end -= start;
 		p = sys->screen + start;
@@ -528,8 +530,8 @@ static void bios_0e(sysctx_t *sys, cpu_state_t *s) {
 			memset(p, *p, end);
 	} else if (h == 1) {
 		uint8_t *s, *p;
-		draw_image(sys, 0, start, get_image(sys, id), 0, -1);
-		if (end > SCREEN_H) end = SCREEN_H;
+		draw_image(sys, 0, start, get_image(sys, id), 0, 0xff, -1);
+		if (end > screen_h) end = screen_h;
 		if (w > SCREEN_W) w = SCREEN_W;
 		if (start >= end) return;
 		end -= start;
@@ -716,7 +718,7 @@ static void flash_emu(sysctx_t *sys, cpu_state_t *s) {
 			FLASH_TRACE("Sector Erase 0x%06x\n", addr);
 			if (addr & 0xfff)
 				ERR_EXIT("unaligned sector address 0x%06x\n", addr);
-			if (addr < SAVE_OFFS || addr >= sys->rom_size)
+			if (addr < sys->save_offs || addr >= sys->rom_size)
 				ERR_EXIT("unexpected erase address 0x%06x\n", addr);
 			if (!(f->flags & 2)) { f->state = FLASH_OFF; break; }
 			memset(sys->rom + addr, 0xff ^ sys->rom_key, 0x1000);
@@ -729,7 +731,7 @@ static void flash_emu(sysctx_t *sys, cpu_state_t *s) {
 				FLASH_TRACE("Page Program 0x%06x\n", addr);
 				if (addr & 0xff)
 					ERR_EXIT("unaligned page address 0x%06x\n", addr);
-				if (addr < SAVE_OFFS || addr >= sys->rom_size)
+				if (addr < sys->save_offs || addr >= sys->rom_size)
 					ERR_EXIT("unexpected program address 0x%06x\n", addr);
 				if (!(f->flags & 2)) { f->state = FLASH_OFF; break; }
 				f->narg = 1 * 16;
@@ -779,15 +781,6 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 		if (pc >= 0x300 && (pc - 0x300) < frame_size) {
 			int addr = pc - 0x300 + 0x10000 + frames[depth - 1].addr;
 			TRACE("%05x: ", addr);
-			// skip delay loops
-			if (addr == 0x1167c)
-				s->a = 0, pc += 0x11689 - 0x1167c, TRACE("SKIP ");
-			else if (addr == 0x12a24)
-				s->x = 0, pc += 0x12a2c - 0x12a24, TRACE("SKIP ");
-			else if (addr == 0x12b8e)
-				s->x = 0, pc += 0x12b96 - 0x12b8e, TRACE("SKIP ");
-			else if (addr == 0x12bfa)
-				s->x = 0, pc += 0x12c02 - 0x12bfa, TRACE("SKIP ");
 		} else {
 			TRACE("%04x: ", pc);
 		}
@@ -1231,22 +1224,27 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 		}
 		if (p) {
 			*p = t;
-			if (o == 0x02) flash_emu(sys, s);
-			else if (o == 0x12) {
-				sys->flash.state = t ? FLASH_OFF : FLASH_READY;
-			} else if (o == 0x00) {
-				/* power off */
-				if (!t) { sys->keys |= 1 << 18 | 1 << 20; break; }
-			} else if (o == 0x8000) { /* lcd_cmd */
-				if (t == 0x28) /* Display OFF */
-					sys->keys |= 1 << 20;
-			}
 #if CPU_TRACE
 			if (o >= 0) TRACE("[0x%02x] = 0x%02x", o, t & 0xff);
 			else if (p == &s->a) TRACE("A = 0x%02x", t & 0xff);
 			else if (p == &s->x) TRACE("X = 0x%02x", t & 0xff);
 			else if (p == &s->y) TRACE("Y = 0x%02x", t & 0xff);
 #endif
+			if (o == 0x02) flash_emu(sys, s);
+			else if (o == 0x12) {
+				sys->flash.state = t ? FLASH_OFF : FLASH_READY;
+			} else if (o == 0x00) {
+				/* power off */
+				if (!t) {
+					TRACE(", power off");
+					sys->keys |= 1 << 18 | 1 << 20; break;
+				}
+			} else if (o == 0x8000) { /* lcd_cmd */
+				if (t == 0x28) { /* Display OFF */
+					TRACE(", display off");
+					sys->keys |= 1 << 20;
+				}
+			}
 		}
 #if CPU_TRACE
 		TRACE("\n");
@@ -1293,28 +1291,27 @@ static void game_event(sysctx_t *sys) {
 				sys->keys |= 1 << 16; return;
 			}
 			key2 = -1;
-			/* arranged by bit number */
 			switch (key) {
-			/* right side button */
-			case SYSKEY_PAGEDOWN:
-			case SYSKEY_A + 'e':
-				key2 = 2; break;
-			/* left side button */
-			case SYSKEY_DELETE:
-			case SYSKEY_A + 'q':
-				key2 = 3; break;
 			/* left (select) */
 			case SYSKEY_LEFT:
 			case SYSKEY_A + 'a':
-				key2 = 4; break;
+				key2 = sys->keymap[0]; break;
 			/* middle (enter) */
 			case SYSKEY_DOWN:
 			case SYSKEY_A + 's':
-				key2 = 5; break;
+				key2 = sys->keymap[1]; break;
 			/* right (back/menu) */
 			case SYSKEY_RIGHT:
 			case SYSKEY_A + 'd':
-				key2 = 6; break;
+				key2 = sys->keymap[2]; break;
+			/* left side button */
+			case SYSKEY_DELETE:
+			case SYSKEY_A + 'q':
+				key2 = sys->keymap[3]; break;
+			/* right side button */
+			case SYSKEY_PAGEDOWN:
+			case SYSKEY_A + 'e':
+				key2 = sys->keymap[4]; break;
 			/* reset */
 			case SYSKEY_A + 'r':
 				key2 = 17; break;
@@ -1376,6 +1373,7 @@ reset:
 
 		// decrease idle timer
 		a = READ16(s->mem + 0x181);
+		//if (a) WRITE16(s->mem + 0x181, a < 30 ? 0 : a - 30);
 		if (a) WRITE16(s->mem + 0x181, a - 1);
 
 		a = sys_time_ms(sys) - last_time;
@@ -1387,6 +1385,7 @@ reset:
 		if (sys->keys & 1 << 19) { /* WAI */
 			sys->keys &= ~(1 << 19);
 		} else {
+			s->mem[0x93] |= 1 << 4; // OK-560 compat: enable timers
 			sys->frame_depth = 0;
 			s->sp = 0x7f; // guess
 			s->pc = 0x60de;
@@ -1443,7 +1442,7 @@ static void check_rom(sysctx_t *sys) {
 static void xor_save(sysctx_t *sys) {
 	unsigned i, key = sys->rom_key;
 	if (key)
-	for (i = SAVE_OFFS; i < sys->rom_size; i++)
+	for (i = sys->save_offs; i < sys->rom_size; i++)
 		sys->rom[i] ^= key;
 }
 
@@ -1489,12 +1488,30 @@ int main(int argc, char **argv) {
 		} else ERR_EXIT("unknown option\n");
 	}
 
-	rom = loadfile(rom_fn, &rom_size, 4 << 20);
-	if (!rom) ERR_EXIT("loading ROM failed\n");
-	if (rom_size != 4 << 20) ERR_EXIT("unexpected ROM size\n");
-
 	memset(&cpu, 0, sizeof(cpu));
 	memset(&sys, 0, sizeof(sys));
+
+	rom = loadfile(rom_fn, &rom_size, 8 << 20);
+	// a rough way to detect a model
+	if (rom_size == 4 << 20) {
+		sys.model = 550;
+		sys.screen_h = 128;
+		sys.keymap[0] = 4;
+		sys.keymap[1] = 5;
+		sys.keymap[2] = 6;
+		sys.keymap[3] = 3;
+		sys.keymap[4] = 2;
+	} else if (rom_size == 8 << 20) {
+		sys.model = 560;
+		sys.screen_h = 160;
+		sys.keymap[0] = 2;
+		sys.keymap[1] = 3;
+		sys.keymap[2] = 4;
+		sys.keymap[3] = 5;
+		sys.keymap[4] = 6;
+	} else ERR_EXIT("unexpected ROM size\n");
+
+	sys.save_offs = rom_size - 0x10000;
 	sys.rom = rom;
 	sys.rom_size = rom_size;
 	sys.zoom = zoom;
@@ -1519,8 +1536,8 @@ int main(int argc, char **argv) {
 		FILE *f = fopen(save_fn, "rb");
 		if (f) {
 			n1 = fread(cpu.mem, 1, sizeof(cpu.mem), f);
-			n2 = fread(sys.rom + SAVE_OFFS, 1, sys.rom_size - SAVE_OFFS, f);
-			n3 = fread(sys.screen, 1, sizeof(sys.screen), f);
+			n2 = fread(sys.rom + sys.save_offs, 1, sys.rom_size - sys.save_offs, f);
+			n3 = fread(sys.screen, 1, SCREEN_W * sys.screen_h, f);
 			(void)n3;
 			fclose(f);
 			if (n1 != sizeof(cpu.mem)) ERR_EXIT("unexpected save size\n");
@@ -1556,8 +1573,8 @@ int main(int argc, char **argv) {
 		if (f) {
 			xor_save(&sys);
 			fwrite(cpu.mem, 1, sizeof(cpu.mem), f);
-			fwrite(sys.rom + SAVE_OFFS, 1, sys.rom_size - SAVE_OFFS, f);
-			fwrite(sys.screen, 1, sizeof(sys.screen), f);
+			fwrite(sys.rom + sys.save_offs, 1, sys.rom_size - sys.save_offs, f);
+			fwrite(sys.screen, 1, SCREEN_W * sys.screen_h, f);
 			fclose(f);
 		}
 	}

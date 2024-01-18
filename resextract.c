@@ -88,7 +88,7 @@ err:
 // uses unknown 4-bit ADPCM
 // but this rough guess sounds close
 static inline int sound_filter(int x) {
-	x = x & 8 ? 7 - x ? x;
+	x = x & 8 ? 7 - x : x;
 	return 128 + x * 8;
 }
 
@@ -178,13 +178,12 @@ int main(int argc, char **argv) {
 	rom_fn = argv[1];
 	if (argc > 2) out_fn = argv[2];
 	if (argc > 3) {
-		res_idx = atoi(argv[3]);
+		res_idx = strtol(argv[3], NULL, 0);
 		if (res_idx >> 24) return 1;
 	}
 
-	rom = loadfile(rom_fn, &rom_size, 4 << 20);
+	rom = loadfile(rom_fn, &rom_size, 8 << 20);
 	if (!rom) ERR_EXIT("loading ROM failed\n");
-	if (rom_size != 4 << 20) ERR_EXIT("unexpected ROM size\n");
 
 	sys.rom = rom;
 	sys.rom_size = rom_size;

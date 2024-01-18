@@ -1,6 +1,6 @@
 ## ToumaPet emulator
 
-This electronic toy uses 65C02 chip. Currently the emulator only works with the OK-550 variant.
+This electronic toy uses 65C02 chip. Currently the emulator only support OK-550 and OK-560 models.
 
 You need to dump the firmware using the programmer. To do this, you need to hold down the reset button so that the game does not turn on while the programmer is working.
 
