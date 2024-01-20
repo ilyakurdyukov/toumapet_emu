@@ -377,7 +377,7 @@ static unsigned get_image(sysctx_t *sys, unsigned id) {
 }
 
 static void draw_image(sysctx_t *sys, int x, int y,
-		unsigned pos, int flip, int mask, int alpha) {
+		unsigned pos, int flip, int blend, int alpha) {
 	int w, h, x_skip = 0, y_skip = 0;
 	uint8_t *d, *src = sys->rom + pos;
 	uint32_t size = sys->rom_size - pos - 4;
@@ -429,8 +429,13 @@ static void draw_image(sysctx_t *sys, int x, int y,
 					if (!n) ERR_EXIT("zero RLE count\n");
 				}
 			}
-			// this is not a mask, but some kind of transparency
-			if (--skip < 0 && a != alpha) *d2 = a & mask;
+			if (--skip < 0 && a != alpha) {
+				int x = a;
+#define X(m) (((x & m) + (blend & m)) & m << 1)
+				if (blend != 0xff) x = (X(0xe3) | X(0x1c)) >> 1;
+#undef X
+				*d2 = x;
+			}
 			d2 += x_add;
 		} while (--w2);
 	} while (--h);
@@ -476,7 +481,7 @@ static void bios_08(sysctx_t *sys, cpu_state_t *s) {
 	int x = s->mem[0x100];
 	int y = s->mem[0x101];
 	int id = READ16(s->mem + 0x102);
-	TRACE("image_draw_alpha (x = %u, y = %u, id = %u, flip = %u, mask = 0x%02x)",
+	TRACE("image_draw_alpha (x = %u, y = %u, id = %u, flip = %u, blend = 0x%02x)",
 			x, y, id, s->mem[0x104], s->mem[0x105]);
 	draw_image(sys, x, y, get_image(sys, id), s->mem[0x104], s->mem[0x105], 0xff);
 }
@@ -486,7 +491,7 @@ static void bios_0a(sysctx_t *sys, cpu_state_t *s) {
 	int y = s->mem[0x101];
 	int id = READ16(s->mem + 0x102);
 	unsigned res_offs = get_image(sys, id);
-	TRACE("image_draw (x = %u, y = %u, id = %u, flip = %u, mask = 0x%02x)",
+	TRACE("image_draw (x = %u, y = %u, id = %u, flip = %u, blend = 0x%02x)",
 			x, y, id, s->mem[0x104], s->mem[0x105]);
 	draw_image(sys, x, y, get_image(sys, id), s->mem[0x104], s->mem[0x105], -1);
 }
@@ -612,13 +617,13 @@ static void bios_1a(sysctx_t *sys, cpu_state_t *s) {
 			READ16(&sys->rom[addr + 1]), sys->rom[addr + 3]);
 }
 
-static void bios_1e(sysctx_t *sys, cpu_state_t *s) {
-	TRACE("bios_1e");
-}
-
 static void bios_1c(sysctx_t *sys, cpu_state_t *s) {
 	int id = READ24(s->mem + 0x80);
 	TRACE("bios_1c (res = %u)", id);
+}
+
+static void bios_1e(sysctx_t *sys, cpu_state_t *s) {
+	TRACE("bios_1e");
 }
 
 static void bios_24(sysctx_t *sys, cpu_state_t *s) {
