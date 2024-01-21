@@ -18,6 +18,7 @@ $ ./toumapet --rom ok550.bin
 ```
 
 * Use `--save <filename>` option to save game state on exit.
+* Use `--update-time` option to update the game time with the system time.
 
 ### Controls
 

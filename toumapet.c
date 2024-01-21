@@ -904,6 +904,18 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 			break;
 		}
 
+#if 0 // CPU memory map
+		// ports (128) + RAM (2048)
+		if (o >= 0x880) {
+			// 0x8000: LCD cmd, 0xc000: LCD data
+			if (o >= 0x8000) p = &dummy;
+			// chip ROM (8192)
+			else if (o >= 0x4000) p = s->mem + (o | 0x6000);
+			// maps to RAM
+			else p = s->mem + 128 + ((o - 128) & 0x7ff);
+		}
+#endif
+
 		if (o >= 0 && !(m & 0x80)) {
 			TRACE("R[0x%02x] ", o);
 			// reads memory
@@ -1336,6 +1348,19 @@ static void game_event(sysctx_t *sys) {
 	}
 }
 
+#include <time.h>
+
+static void update_time(cpu_state_t *s) {
+	time_t t = time(NULL);
+	struct tm *tm = localtime(&t);
+	s->mem[0x1df] = tm->tm_year % 100;
+	s->mem[0x1e0] = tm->tm_mon;
+	s->mem[0x1e1] = tm->tm_mday - 1;
+	s->mem[0x1e2] = tm->tm_hour;
+	s->mem[0x1e3] = tm->tm_min;
+	s->mem[0x1e4] = tm->tm_sec * 2;
+}
+
 void run_game(sysctx_t *sys, cpu_state_t *s) {
 	unsigned disp_time, frames, fps = 30;
 	unsigned last_time, timer_rem;
@@ -1461,7 +1486,7 @@ int main(int argc, char **argv) {
 	uint8_t *rom; size_t rom_size;
 	cpu_state_t cpu;
 	sysctx_t sys;
-	int zoom = 3;
+	int zoom = 3, upd_time = 0;
 
 	while (argc > 1) {
 		if (!strcmp(argv[1], "--save")) {
@@ -1479,7 +1504,7 @@ int main(int argc, char **argv) {
 			log_fn = argv[2];
 			if (!*log_fn) log_fn = NULL;
 			argc -= 2; argv += 2;
-		} else if (!strcmp(argv[1], "--log_size")) {
+		} else if (!strcmp(argv[1], "--log-size")) {
 			if (argc <= 2) ERR_EXIT("bad option\n");
 			log_size = atoi(argv[2]);
 			argc -= 2; argv += 2;
@@ -1490,6 +1515,9 @@ int main(int argc, char **argv) {
 			if (zoom < 1) zoom = 1;
 			if (zoom > 5) zoom = 5;
 			argc -= 2; argv += 2;
+		} else if (!strcmp(argv[1], "--update-time")) {
+			upd_time = 1;
+			argc -= 1; argv += 1;
 		} else ERR_EXIT("unknown option\n");
 	}
 
@@ -1497,6 +1525,7 @@ int main(int argc, char **argv) {
 	memset(&sys, 0, sizeof(sys));
 
 	rom = loadfile(rom_fn, &rom_size, 8 << 20);
+	if (!rom) ERR_EXIT("can't load ROM file\n");
 	// a rough way to detect a model
 	if (rom_size == 4 << 20) {
 		sys.model = 550;
@@ -1570,6 +1599,8 @@ int main(int argc, char **argv) {
 		sys_close(&sys);
 		return 0;
 	}
+
+	if (upd_time) update_time(&cpu);
 
 	run_game(&sys, &cpu);
 
