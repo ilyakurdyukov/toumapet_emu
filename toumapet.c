@@ -149,19 +149,12 @@ static void sys_init(sysctx_t *sys) {
 
 	for (i = 0; i < 256; i++) {
 		unsigned r, g, b;
-#if 1
-		// pow(i * 1.0 / 7, 2.0) * 255 + 0.5
-		uint8_t gamma3[] = { 0, 5, 21, 47, 83, 130, 187, 255 };
-		// pow(i * 1.0 / 3, 2.0) * 255 + 0.5
-		uint8_t gamma2[] = { 0, 28, 113, 255 };
-		r = gamma3[i >> 5 & 7];
-		g = gamma3[i >> 2 & 7];
-		b = gamma2[i & 3];
-#else
-		r = (i >> 5 & 7) * 0x49 >> 1;
-		g = (i >> 2 & 7) * 0x49 >> 1;
-		b = (i & 3) * 0x55;
-#endif
+		static const uint8_t curve_r[] = { 0, 8, 24, 57, 99, 123, 214, 255 };
+		static const uint8_t curve_g[] = { 0, 12, 24, 48, 85, 125, 170, 255 };
+		static const uint8_t curve_b[] = { 0, 66, 132, 255 };
+		r = curve_r[i >> 5 & 7];
+		g = curve_g[i >> 2 & 7];
+		b = curve_b[i & 3];
 		sys->pal[i] = r << rs | g << gs | b << bs | 0xff << as;
 	}
 }
@@ -493,7 +486,7 @@ static void bios_0a(sysctx_t *sys, cpu_state_t *s) {
 	unsigned res_offs = get_image(sys, id);
 	TRACE("image_draw (x = %u, y = %u, id = %u, flip = %u, blend = 0x%02x)",
 			x, y, id, s->mem[0x104], s->mem[0x105]);
-	draw_image(sys, x, y, get_image(sys, id), s->mem[0x104], s->mem[0x105], -1);
+	draw_image(sys, x, y, get_image(sys, id), s->mem[0x104], 0xff, -1);
 }
 
 static void bios_0c(sysctx_t *sys, cpu_state_t *s) {

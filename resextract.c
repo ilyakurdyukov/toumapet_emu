@@ -87,7 +87,9 @@ err:
 
 // uses unknown 4-bit ADPCM
 // but this rough guess sounds close
-static inline int sound_filter(int x) {
+typedef struct { uint8_t dummy; } adpcm_status_t;
+static void adpcm_init(adpcm_status_t *adpcm) {}
+static unsigned adpcm_decode(adpcm_status_t *adpcm, unsigned x) {
 	x = x & 8 ? 7 - x : x;
 	return 128 + x * 8;
 }
@@ -110,13 +112,15 @@ static void decode_sound(uint8_t *src, size_t size, const char *fn) {
 	int bytes_sample = ch * (bits >> 3);
 	int samples = (size - 1) * 2;
 	uint8_t *d, *data = malloc(samples);
+	adpcm_status_t adpcm;
 	if (!data) { printf("malloc failed"); return; }
 
 	d = data;
+	adpcm_init(&adpcm);
 	for (i = 1; i < size; i++) {
 		int a = src[i];
-		*d++ = sound_filter(a & 15);
-		*d++ = sound_filter(a >> 4);
+		*d++ = adpcm_decode(&adpcm, a & 15);
+		*d++ = adpcm_decode(&adpcm, a >> 4);
 	}
 
 	memcpy(head.riff, "RIFF", 4);
@@ -191,19 +195,12 @@ int main(int argc, char **argv) {
 
 	p = pal[0];
 	for (i = 0; i < 256; i++, p += 3) {
-#if 1
-		// pow(i * 1.0 / 7, 2.0) * 255 + 0.5
-		uint8_t gamma3[] = { 0, 5, 21, 47, 83, 130, 187, 255 };
-		// pow(i * 1.0 / 3, 2.0) * 255 + 0.5
-		uint8_t gamma2[] = { 0, 28, 113, 255 };
-		p[0] = gamma3[i >> 5 & 7];
-		p[1] = gamma3[i >> 2 & 7];
-		p[2] = gamma2[i & 3];
-#else
-		p[0] = (i >> 5 & 7) * 0x49 >> 1;
-		p[1] = (i >> 2 & 7) * 0x49 >> 1;
-		p[2] = (i & 3) * 0x55;
-#endif
+		static const uint8_t curve_r[] = { 0, 8, 24, 57, 99, 123, 214, 255 };
+		static const uint8_t curve_g[] = { 0, 12, 24, 48, 85, 125, 170, 255 };
+		static const uint8_t curve_b[] = { 0, 66, 132, 255 };
+		p[0] = curve_r[i >> 5 & 7];
+		p[1] = curve_g[i >> 2 & 7];
+		p[2] = curve_b[i & 3];
 	}
 
 	res_tab = READ24(rom);
