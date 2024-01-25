@@ -70,6 +70,7 @@ typedef struct {
 	uint8_t keymap[5];
 	flash_t flash;
 	unsigned zoom, keys, model, screen_h;
+	unsigned pixels_count;
 	window_t window;
 #if !USE_SDL && defined(_WIN32)
 	double time_mul;
@@ -403,6 +404,7 @@ static void draw_image(sysctx_t *sys, int x, int y,
 		y_skip = h2 - y;
 	}
 	if (w <= 0 || h <= 0) return;
+	sys->pixels_count += w * h;
 	do {
 		int len = READ16(src);
 		uint8_t *s = src + 2, *d2 = d;
@@ -451,6 +453,7 @@ static void draw_char(sysctx_t *sys, int x, int y,
 	if (y + h > screen_h) h = screen_h - y;
 	d = &sys->screen[y * SCREEN_W + x];
 	s = sys->rom + pos;
+	sys->pixels_count += w * h;
 	for (y = 0; y < h; y++, d += SCREEN_W) {
 		int a = *s++;
 		for (x = 0; x < w; x++, a <<= 1)
@@ -463,7 +466,7 @@ static void bios_06(sysctx_t *sys, cpu_state_t *s) {
 	unsigned rom_size = sys->rom_size;
 	unsigned id = READ16(s->mem + 0x100);
 	unsigned res_offs;
-	WRITE16(s->mem + 0x102, id); // probably copies the id
+	WRITE16(s->mem + 0x102, id); // copies the id
 	TRACE("image_size (id = %u)", id);
 	res_offs = get_image(sys, id);
 	s->mem[0x85] = sys->rom[res_offs]; // width
@@ -500,6 +503,7 @@ static void bios_0c(sysctx_t *sys, cpu_state_t *s) {
 	if (end > screen_h) end = screen_h;
 	if (start >= end) return;
 	end -= start;
+	sys->pixels_count += SCREEN_W * end;
 	memset(sys->screen + start * SCREEN_W, color, SCREEN_W * end);
 }
 
@@ -524,6 +528,7 @@ static void bios_0e(sysctx_t *sys, cpu_state_t *s) {
 		if (start >= end) return;
 		end -= start;
 		p = sys->screen + start;
+		sys->pixels_count += h * end;
 		for (y = 0; y < h; y++, p += SCREEN_W)
 			memset(p, *p, end);
 	} else if (h == 1) {
@@ -534,8 +539,65 @@ static void bios_0e(sysctx_t *sys, cpu_state_t *s) {
 		if (start >= end) return;
 		end -= start;
 		p = s = sys->screen + start * SCREEN_W;
+		sys->pixels_count += w * end;
 		while (--end) memcpy(p += SCREEN_W, s, w);
 	} else ERR_EXIT("unknown repeat mode");
+}
+
+typedef struct {
+	uint8_t *src, *end;
+	uint8_t w, h, flip, x_skip;
+} image_dec_t;
+
+static void skip_lines(image_dec_t *img, unsigned y_skip) {
+	uint8_t *src = img->src;
+	uint8_t *end = img->end;
+	int h = img->h, n = y_skip;
+	if (img->flip & 2) n = h - 1 - n;
+	img->h = h - y_skip;
+	for (; n; n--) {
+		int len = READ16(src);
+		if (len < 4) ERR_EXIT("RLE error\n");
+		if (end - src < len)
+			ERR_EXIT("read outside the ROM\n");
+		src += len;
+		if (READ16(src - 2) != len)
+			ERR_EXIT("RLE tail size doesn't match\n");
+	}
+	img->src = src;
+}
+
+static int decode_line(image_dec_t *img, uint8_t *d, unsigned w, int check) {
+	uint8_t *src = img->src;
+	int len = READ16(src);
+	uint8_t *s = src + 2;
+	int a = 0, n = 1, skip = img->x_skip;
+	int x_add = 1;
+	if (img->end - src < len)
+		ERR_EXIT("read outside the ROM\n");
+	img->src = img->flip & 2 ? src - READ16(src - 2) : src + len;
+	len -= 4;
+	if (img->flip & 1) {
+		d += w - 1; x_add = -1;
+		skip = img->w - skip - w;
+	}
+	w += skip;
+	do {
+		if (!--n) {
+			if ((len -= 1) < 0) ERR_EXIT("RLE error\n");
+			a = *s++; n = 1;
+			if (!a) {
+				if ((len -= 2) < 0) ERR_EXIT("RLE error\n");
+				a = *s++; n = *s++;
+				if (!n) ERR_EXIT("zero RLE count\n");
+			}
+		}
+		if (--skip < 0) {
+			if (check && (*d & a) != 0xff) return 0xff;
+			*d = a, d += x_add;
+		}
+	} while (--w);
+	return 0;
 }
 
 static void bios_10(sysctx_t *sys, cpu_state_t *s) {
@@ -546,64 +608,82 @@ static void bios_10(sysctx_t *sys, cpu_state_t *s) {
 	int y2 = s->mem[0x106];
 	int id2 = READ16(s->mem + 0x107);
 	int w1, h1, w2, h2, cmp;
-	unsigned res_offs;
+	uint8_t *src1, *src2;
 	TRACE("check_intersect ("
 			"x1 = %u, y1 = %u, id1 = %u, flip = %u, "
 			"x2 = %u, y2 = %u, id2 = %u, flip = %u)",
 			x1, y1, id1, s->mem[0x104],
 			x2, y2, id2, s->mem[0x109]);
-	res_offs = get_image(sys, id1);
-	w1 = sys->rom[res_offs];
-	h1 = sys->rom[res_offs + 2];
-	res_offs = get_image(sys, id2);
-	w2 = sys->rom[res_offs];
-	h2 = sys->rom[res_offs + 2];
+	src1 = sys->rom + get_image(sys, id1);
+	w1 = src1[0]; h1 = src1[2];
+	src2 = sys->rom + get_image(sys, id2);
+	w2 = src2[0]; h2 = src2[2];
 	cmp = 0;
 	if (((x2 - x1) & 0xff) < w1) cmp |= 1;
-	if (((x1 - x2) & 0xff) < w2) cmp |= 1 + 4;
+	if (((x1 - x2) & 0xff) < w2) cmp |= 1 + 4; /* x1 >= x2 */
 	if (((y2 - y1) & 0xff) < h1) cmp |= 2;
-	if (((y1 - y2) & 0xff) < h2) cmp |= 2 + 8;
-	if ((cmp & 3) != 3) {
-		TRACE(" a = 0");
-		s->a = 0; return;
+	if (((y1 - y2) & 0xff) < h2) cmp |= 2 + 8; /* y1 >= y2 */
+	s->a = 0;
+	sys->pixels_count += w1 * h1 + w2 * h2;
+	if ((cmp & 3) == 3) {
+		uint8_t buf[256];
+		image_dec_t img1, img2;
+		TRACE(" !");
+		img1.src = src1 + 4; img1.w = w1; img1.h = h1;
+		img2.src = src2 + 4; img2.w = w2; img2.h = h2;
+		w1 -= img1.x_skip = cmp & 4 ? 0 : (x2 - x1) & 0xff;
+		w2 -= img2.x_skip = cmp & 4 ? (x1 - x2) & 0xff : 0;
+		w1 = w1 < w2 ? w1 : w2;
+		img1.flip = s->mem[0x104];
+		img2.flip = s->mem[0x109];
+		img2.end = img1.end = sys->rom + sys->rom_size;
+		skip_lines(&img1, cmp & 8 ? 0 : (y2 - y1) & 0xff);
+		skip_lines(&img2, cmp & 8 ? (y1 - y2) & 0xff : 0);
+		h1 = img1.h;
+		h2 = img2.h;
+		h1 = h1 < h2 ? h1 : h2;
+		do {
+			decode_line(&img1, buf, w1, 0);
+			if (decode_line(&img2, buf, w1, 1)) {
+				s->a = 0xff;
+				break;
+			}
+		} while (--h1);
 	}
-	TRACE(" a = 1");
-	s->a = 1;
+	TRACE(" a = 0x%02x", s->a);
 }
 
 static void bios_14(sysctx_t *sys, cpu_state_t *s) {
 	unsigned addr = READ24(s->mem + 0x80);
-	TRACE("bios_14 (addr = 0x%x, %u)", addr, s->mem[0x85]);
+	TRACE("play_sound_0 (addr = 0x%x, repeats = %u)", addr, s->mem[0x85]);
 	if (sys->rom_size < addr + 4)
 		ERR_EXIT("read outside the ROM (0x%x)\n", addr);
 	TRACE(" 0x%02x, id = %u, 0x%02x", sys->rom[addr],
 			READ16(&sys->rom[addr + 1]), sys->rom[addr + 3]);
 }
 
-// 0x2c471
 static void bios_16(sysctx_t *sys, cpu_state_t *s) {
 	unsigned addr = READ24(s->mem + 0x80);
-	TRACE("bios_16 (addr = 0x%x, %u)", addr, s->mem[0x85]);
+	TRACE("play_sound_1 (addr = 0x%x, repeats = %u)", addr, s->mem[0x85]);
 	if (sys->rom_size < addr + 4)
 		ERR_EXIT("read outside the ROM (0x%x)\n", addr);
 	TRACE(" 0x%02x, id = %u, 0x%02x", sys->rom[addr],
 			READ16(&sys->rom[addr + 1]), sys->rom[addr + 3]);
 }
 
-// 0x2c537
 static void bios_18(sysctx_t *sys, cpu_state_t *s) {
 	unsigned addr = READ24(s->mem + 0x80);
-	TRACE("bios_18 (addr = 0x%x, %u)", addr, s->mem[0x85]);
+	TRACE("play_sound_2 (addr = 0x%x, repeats = %u)", addr, s->mem[0x85]);
 	if (sys->rom_size < addr + 4)
 		ERR_EXIT("read outside the ROM (0x%x)\n", addr);
 	TRACE(" 0x%02x, id = %u, 0x%02x", sys->rom[addr],
 			READ16(&sys->rom[addr + 1]), sys->rom[addr + 3]);
 }
 
-// 0x2714f
 static void bios_1a(sysctx_t *sys, cpu_state_t *s) {
 	unsigned addr = READ24(s->mem + 0x80);
-	TRACE("bios_1a (addr = 0x%x, %u)", addr, s->mem[0x85]);
+	// uses the last free channel
+	TRACE("play_sound (addr = 0x%x, repeats = %u)", addr, s->mem[0x85]);
 	if (sys->rom_size < addr + 4)
 		ERR_EXIT("read outside the ROM (0x%x)\n", addr);
 	TRACE(" 0x%02x, id = %u, 0x%02x", sys->rom[addr],
@@ -611,12 +691,13 @@ static void bios_1a(sysctx_t *sys, cpu_state_t *s) {
 }
 
 static void bios_1c(sysctx_t *sys, cpu_state_t *s) {
-	int id = READ24(s->mem + 0x80);
-	TRACE("bios_1c (res = %u)", id);
+	int id = READ16(s->mem + 0x80);
+	// zero repeats means endless
+	TRACE("play_music (res = %u, repeats = %u)", id, s->mem[0x82]);
 }
 
 static void bios_1e(sysctx_t *sys, cpu_state_t *s) {
-	TRACE("bios_1e");
+	TRACE("stop_music");
 }
 
 static void bios_24(sysctx_t *sys, cpu_state_t *s) {
@@ -638,7 +719,8 @@ static void bios_26(sysctx_t *sys, cpu_state_t *s) {
 
 static void bios_2c(sysctx_t *sys, cpu_state_t *s) {
 	unsigned addr = READ24(s->mem + 0x80);
-	TRACE("bios_2c (addr = 0x%x, %u)", addr, s->mem[0x85]);
+	// uses channel 2 but with some extra settings
+	TRACE("play_sound_2a (addr = 0x%x, repeats = %u)", addr, s->mem[0x85]);
 	if (sys->rom_size < addr + 4)
 		ERR_EXIT("read outside the ROM (0x%x)\n", addr);
 	TRACE(" 0x%02x, id = %u, 0x%02x", sys->rom[addr],
@@ -1354,9 +1436,9 @@ static void update_time(cpu_state_t *s) {
 	s->mem[0x1e4] = tm->tm_sec * 2;
 }
 
-void run_game(sysctx_t *sys, cpu_state_t *s) {
+static void run_game(sysctx_t *sys, cpu_state_t *s) {
 	unsigned disp_time, frames, fps = 30;
-	unsigned last_time, timer_rem;
+	unsigned last_time, frame_skip = 0;
 reset:
 	frames = 0;
 	if (!sys->init_done) {
@@ -1376,7 +1458,6 @@ reset:
 	}
 
 	last_time = sys_time_ms(sys);
-	timer_rem = 0;
 
 #ifndef START_DELAY
 // to be able to open the test menu
@@ -1394,31 +1475,51 @@ reset:
 		int ev;
 		unsigned a, cur_time;
 
+		if (!(s->mem[0x93] & 1 << 4)) {
+			int i;
+			for (i = 0; i < 10; i++) {
+				a = s->mem[0x183 + i];
+				if (a) s->mem[0x183 + i] = a - 1;
+			}
+		}
+
+		a = s->mem[0xaf];
+		if (a & 0x3f) s->mem[0xaf] = a - 1;
+
 		// decrease idle timer
 		a = READ16(s->mem + 0x181);
 		//if (a) WRITE16(s->mem + 0x181, a < 30 ? 0 : a - 30);
 		if (a) WRITE16(s->mem + 0x181, a - 1);
 
 		a = sys_time_ms(sys) - last_time;
-		a = a * 256 / 1000;
-		last_time += (a >> 8) * 1000;
-		s->mem[0xaf] += a - timer_rem;
-		timer_rem = a;
+		if (a > 500) {
+			last_time += 500;
+			s->mem[0xaf] |= 1 << 7;
+		}
 
 		if (sys->keys & 1 << 19) { /* WAI */
 			sys->keys &= ~(1 << 19);
 		} else {
-			s->mem[0x93] |= 1 << 4; // OK-560 compat: enable timers
+			sys->pixels_count = 0;
 			sys->frame_depth = 0;
 			s->sp = 0x7f; // guess
 			s->pc = 0x60de;
 			WRITE24(s->mem + 0x80, READ16(sys->rom + 0x1b));
 			WRITE16(s->mem + 0x83, READ16(sys->rom + 0x1b + 2));
 		}
-		run_emu(sys, s);
-		if (sys->keys & 1 << 20) { // clean screen
-			sys->keys &= ~(1 << 20);
-			memset(sys->screen, 0, sizeof(sys->screen));
+		if (frame_skip) frame_skip--;
+		else {
+			run_emu(sys, s);
+			if (sys->frame_depth == 0) {
+				/* Mini-games run too fast, because the real CPU */
+				/* can't compute one frame in time. */
+				/* This is a heuristic to solve this. */
+				frame_skip = sys->pixels_count / 20000;
+			}
+			if (sys->keys & 1 << 20) { // clean screen
+				sys->keys &= ~(1 << 20);
+				memset(sys->screen, 0, sizeof(sys->screen));
+			}
 		}
 
 		sys_update(sys);
