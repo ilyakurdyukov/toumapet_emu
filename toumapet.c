@@ -60,7 +60,7 @@ typedef struct {
 typedef struct {
 	uint8_t state, cmd, narg, flags;
 	uint8_t args[3];
-	uint32_t addr;
+	uint32_t addr, pos;
 } flash_t;
 
 typedef struct {
@@ -785,13 +785,13 @@ static void flash_emu(sysctx_t *sys, cpu_state_t *s) {
 		case 0x02: /* Page Program */
 		case 0x20: /* Sector Erase */
 			f->state = FLASH_CMD2; f->narg = 3 * 16;
-			f->addr = ~0;
+			f->pos = ~0;
 			break;
 		default:
 			ERR_EXIT("unknown flash cmd 0x%02x\n", f->cmd);
 		}
 	} else {
-		unsigned addr;
+		unsigned addr, pos;
 		switch (f->cmd) {
 		case 0x20: /* Sector Erase */
 			addr = READ24(f->args);
@@ -805,21 +805,23 @@ static void flash_emu(sysctx_t *sys, cpu_state_t *s) {
 			f->state = FLASH_OFF;
 			break;
 		case 0x02: /* Page Program */
-			addr = f->addr;
-			if (addr == ~0u) {
+			pos = f->pos;
+			if (pos == ~0u) {
 				f->addr = addr = READ24(f->args);
 				FLASH_TRACE("Page Program 0x%06x\n", addr);
-				if (addr & 0xff)
-					ERR_EXIT("unaligned page address 0x%06x\n", addr);
 				if (addr < sys->save_offs || addr >= sys->rom_size)
 					ERR_EXIT("unexpected program address 0x%06x\n", addr);
 				if (!(f->flags & 2)) { f->state = FLASH_OFF; break; }
-				f->narg = 1 * 16;
+				f->narg = 1 * 16; f->pos = 0;
 			} else {
-				sys->rom[addr] = f->args[0] ^ sys->rom_key;
-				f->addr = ++addr;
-				if (addr & 0xff) f->narg = 1 * 16;
-				else f->state = FLASH_OFF;
+				int old;
+				addr = f->addr;
+				addr = (addr & ~0xff) | ((addr + pos) & 0xff);
+				old = sys->rom[addr] ^ sys->rom_key;
+				sys->rom[addr] = (old & f->args[0]) ^ sys->rom_key;
+				f->pos = ++pos;
+				if (pos < 256) f->narg = 1 * 16;
+				else FLASH_TRACE("flash page overflow\n");
 			}
 			break;
 		default:
@@ -848,7 +850,10 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 #define NEXT s->mem[pc++ & 0xffff]
 
 	for (;;) {
-		unsigned m, op;
+#if CPU_TRACE
+		unsigned pc2;
+#endif
+		unsigned m, op; uint8_t dummy;
 		int o = -1; uint8_t *p = NULL;
 
 #if TICK_LIMIT
@@ -858,12 +863,11 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 
 		pc &= 0xffff;
 #if CPU_TRACE
+		pc2 = pc;
 		if (pc >= 0x300 && (pc - 0x300) < frame_size) {
-			int addr = pc - 0x300 + 0x10000 + frames[depth - 1].addr;
-			TRACE("%05x: ", addr);
-		} else {
-			TRACE("%04x: ", pc);
+			pc2 = pc - 0x300 + 0x10000 + frames[depth - 1].addr;
 		}
+		TRACE("%04x: ", pc2);
 #endif
 #define SYS_RET 0x7000
 #define SYS_RET1 0x7001
@@ -979,17 +983,16 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 			break;
 		}
 
-#if 0 // CPU memory map
+		// CPU memory map
 		// ports (128) + RAM (2048)
 		if (o >= 0x880) {
 			// 0x8000: LCD cmd, 0xc000: LCD data
-			if (o >= 0x8000) p = &dummy;
+			if (o >= 0x8000) p = &dummy, *p = 0;
 			// chip ROM (8192)
 			else if (o >= 0x4000) p = s->mem + (o | 0x6000);
 			// maps to RAM
 			else p = s->mem + 128 + ((o - 128) & 0x7ff);
 		}
-#endif
 
 		if (o >= 0 && !(m & 0x80)) {
 			TRACE("R[0x%02x] ", o);
@@ -1316,6 +1319,10 @@ void run_emu(sysctx_t *sys, cpu_state_t *s) {
 		}
 		if (p) {
 			*p = t;
+#if 0 // out port trace
+			if ((unsigned)o < 0x80)
+				printf("%04x: [0x%02x] = 0x%02x\n", pc2, o, t);
+#endif
 #if CPU_TRACE
 			if (o >= 0) TRACE("[0x%02x] = 0x%02x", o, t & 0xff);
 			else if (p == &s->a) TRACE("A = 0x%02x", t & 0xff);
@@ -1514,7 +1521,7 @@ reset:
 				/* Mini-games run too fast, because the real CPU */
 				/* can't compute one frame in time. */
 				/* This is a heuristic to solve this. */
-				frame_skip = sys->pixels_count / 20000;
+				frame_skip = (sys->pixels_count > 20000) + (sys->pixels_count > 40000);
 			}
 			if (sys->keys & 1 << 20) { // clean screen
 				sys->keys &= ~(1 << 20);
