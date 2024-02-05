@@ -374,16 +374,23 @@ static void draw_image(sysctx_t *sys, int x, int y,
 		unsigned pos, int flip, int blend, int alpha) {
 	int w, h, x_skip = 0, y_skip = 0;
 	uint8_t *d, *src = sys->rom + pos;
-	uint32_t size = sys->rom_size - pos - 4;
+	uint32_t size = sys->rom_size - pos;
 	int x_add, y_add, w2, h2;
 	int screen_h = sys->screen_h;
 
-	if (src[1] != 0 || src[3] != 0x80)
-		ERR_EXIT("unsupported image\n");
-	w2 = w = src[0]; h2 = h = src[2]; src += 4;
+	if (flip > 4) ERR_EXIT("unsupported flip\n");
+	if (flip & 4) {
+		w = src[0]; h = src[1]; src += 2;
+		w2 = ((w + 7) >> 3) * h + 2;
+		if ((int)size < w2)
+			ERR_EXIT("read outside the ROM\n");
+	} else {
+		if (src[1] != 0 || src[3] != 0x80)
+			ERR_EXIT("unsupported image\n");
+		w = src[0]; h = src[2]; src += 4; size -= 4;
+	}
 
-	if (flip > 3) ERR_EXIT("unsupported flip\n");
-
+	w2 = w; h2 = h;
 	if (x >= SCREEN_W) x = (int8_t)x, x_skip = -x;
 	if (y >= screen_h) y = (int8_t)y, y_skip = -y;
 
@@ -405,7 +412,21 @@ static void draw_image(sysctx_t *sys, int x, int y,
 	}
 	if (w <= 0 || h <= 0) return;
 	sys->pixels_count += w * h;
-	do {
+	if (flip & 4) {
+		int len = (w + 7) >> 3;
+		do {
+			uint8_t *s = src, *d2 = d;
+			int a = -1, skip = x_skip;
+			src += len; d += y_add;
+			if (--y_skip >= 0) continue;
+			w2 = w; do {
+				if (a & 1 << 16) a = *s++ | 0x100;
+				if (--skip < 0 && (a & 0x80)) *d2 = blend;
+				d2 += x_add;
+				a <<= 1;
+			} while (--w2);
+		} while (--h);
+	} else do {
 		int len = READ16(src);
 		uint8_t *s = src + 2, *d2 = d;
 		int a = 0, n = 1, skip = x_skip;
@@ -1432,15 +1453,17 @@ static void game_event(sysctx_t *sys) {
 
 #include <time.h>
 
-static void update_time(cpu_state_t *s) {
+static void update_time(sysctx_t *sys, cpu_state_t *s) {
 	time_t t = time(NULL);
 	struct tm *tm = localtime(&t);
-	s->mem[0x1df] = tm->tm_year % 100;
-	s->mem[0x1e0] = tm->tm_mon;
-	s->mem[0x1e1] = tm->tm_mday - 1;
-	s->mem[0x1e2] = tm->tm_hour;
-	s->mem[0x1e3] = tm->tm_min;
-	s->mem[0x1e4] = tm->tm_sec * 2;
+	// ToumaPet or QPet 2
+	int off = sys->model >= 550 ? 0x1df : 0x1dc;
+	s->mem[off] = tm->tm_year % 100;
+	s->mem[off + 1] = tm->tm_mon;
+	s->mem[off + 2] = tm->tm_mday - 1;
+	s->mem[off + 3] = tm->tm_hour;
+	s->mem[off + 4] = tm->tm_min;
+	s->mem[off + 5] = tm->tm_sec * 2;
 }
 
 static void run_game(sysctx_t *sys, cpu_state_t *s) {
@@ -1628,7 +1651,15 @@ int main(int argc, char **argv) {
 	rom = loadfile(rom_fn, &rom_size, 8 << 20);
 	if (!rom) ERR_EXIT("can't load ROM file\n");
 	// a rough way to detect a model
-	if (rom_size == 4 << 20) {
+	if (rom_size == 2 << 20) {
+		sys.model = 2; // QPet 2
+		sys.screen_h = 128;
+		sys.keymap[0] = 4;
+		sys.keymap[1] = 5;
+		sys.keymap[2] = 6;
+		sys.keymap[3] = 8; // no button
+		sys.keymap[4] = 8; // no button
+	} else if (rom_size == 4 << 20) {
 		sys.model = 550;
 		sys.screen_h = 128;
 		sys.keymap[0] = 4;
@@ -1701,7 +1732,7 @@ int main(int argc, char **argv) {
 		return 0;
 	}
 
-	if (upd_time) update_time(&cpu);
+	if (upd_time) update_time(&sys, &cpu);
 
 	run_game(&sys, &cpu);
 

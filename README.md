@@ -1,6 +1,6 @@
 ## ToumaPet emulator
 
-This electronic toy uses 65C02 chip. Currently the emulator only support OK-550 and OK-560 models.
+This electronic toy uses 65C02 chip. Currently the emulator support QPet-2, OK-550 and OK-560 models.
 
 You need to dump the firmware using the programmer. To do this, you need to hold down the reset button so that the game does not turn on while the programmer is working.
 
@@ -30,6 +30,8 @@ $ ./toumapet --rom ok550.bin
 | Q/Delete         | left side button   |
 | E/PageDown       | right side button  |
 | R                | reset the game     |
+
+* QPet doesn't have side buttons.
 
 ### What is not working
 
