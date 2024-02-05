@@ -31,6 +31,47 @@ static uint8_t pal[256][3];
 #define READ16(p) ((p)[0] | (p)[1] << 8)
 #define READ24(p) ((p)[0] | (p)[1] << 8 | (p)[2] << 16)
 
+static int decode_image_1bit(uint8_t *src, size_t size, const char *fn) {
+	int w, h, x, y; const char *err_str;
+	uint8_t *data = NULL, *d; FILE *f;
+
+#define GOTO_ERR(str) do { \
+	err_str = str; goto err; \
+} while (0)
+
+	if (size < 2) GOTO_ERR("too small");
+	w = src[0]; h = src[1]; src += 2;
+	data = malloc(w * h);
+	if (!data) GOTO_ERR("malloc failed");
+	x = ((w + 7) >> 3) * h + 2;
+	if (size < x) GOTO_ERR("too small");
+
+	d = data;
+	for (y = 0; y < h; y++, d += w) {
+		int a = -1;
+		for (x = 0; x < w; x++, a <<= 1) {
+			if (a & 1 << 16) a = *src++ | 0x100;
+			d[x] = (a >> 7 & 1) + '0';
+		}
+	}
+#undef GOTO_ERR
+
+	f = fopen(fn, "wb");
+	if (f) {
+		fprintf(f, "P1\n%u %u\n", w, h);
+		for (y = 0; y < h; y++)
+			fwrite(data + y * w, 1, w, f);
+		fclose(f);
+	}
+	free(data);
+	return 0;
+
+err:
+	printf("unpack_image failed (%s)\n", err_str);
+	if (data) free(data);
+	return 1;
+}
+
 static int decode_image(uint8_t *src, size_t size, const char *fn) {
 	int w, h, x, y; const char *err_str;
 	uint8_t *data = NULL, *d; FILE *f;
@@ -212,7 +253,7 @@ int main(int argc, char **argv) {
 		if (end > i * 3) end = i * 3 + 1;
 	}
 	for (; i * 3 < end; i++) {
-		const char * const ext[] = { "bin", "ppm", "wav" };
+		const char * const ext[] = { "bin", "ppm", "wav", "pbm" };
 		char name[256]; int type = 0;
 		unsigned addr = READ24(rom + res_tab + i * 3);
 		unsigned next = READ24(rom + res_tab + i * 3 + 3);
@@ -226,6 +267,11 @@ int main(int argc, char **argv) {
 #if 1
 			else if (rom[addr] == 0x81) type = 2;
 #endif
+			else {
+				int w = rom[addr], h = rom[addr + 1];
+				int st = (w + 7) >> 3;
+				if (w <= 0x80 && h <= 0x80 && res_size == st * h + 2) type = 3;
+			}
 		}
 
 		if (res_idx >= 0)
@@ -238,6 +284,9 @@ int main(int argc, char **argv) {
 			if (ret) printf("error at res%u (addr = 0x%x)\n", i, addr);
 		} else if (type == 2) {
 			decode_sound(rom + addr, res_size, name);
+		} else if (type == 3) {
+			int ret = decode_image_1bit(rom + addr, res_size, name);
+			if (ret) printf("error at res%u (addr = 0x%x)\n", i, addr);
 		} else {
 			FILE *f = fopen(name, "wb");
 			if (!f) break;
